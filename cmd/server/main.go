@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"time"
 
 	"SnapGo/internal/cache"
 	"SnapGo/internal/discovery"
@@ -17,7 +18,8 @@ func main() {
 	flag.Parse()
 
 	// 2. Initialize the core cache engine
-	myCache := cache.New()
+	// Tell the background sweeper to run every 10 seconds
+	myCache := cache.New(10 * time.Second)
 
 	// 3. Initialize the Gossip Membership
 	fmt.Println("Starting gossip protocol...")

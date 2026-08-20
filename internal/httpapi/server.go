@@ -1,13 +1,15 @@
 package httpapi
 
 import (
-	"fmt"
-	"io"
-	"net/http"
-
 	"SnapGo/internal/cache"
 	"SnapGo/internal/discovery"
 	"SnapGo/internal/hashing"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"sync"
+	"sync/atomic"
 )
 
 type Server struct {
@@ -50,39 +52,70 @@ func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing key or val", http.StatusBadRequest)
 		return
 	}
+	// Parse the TTL (default to 0 if not provided)
+	ttlStr := r.URL.Query().Get("ttl")
+	ttl := 0
+	if ttlStr != "" {
+		parsed, err := strconv.Atoi(ttlStr)
+		if err == nil {
+			ttl = parsed
+		}
+	}
 
-	// 1. Build the Hash Ring
 	activeNodes := s.membership.GetMembers()
 	ring := hashing.New(50)
 	ring.AddNodes(activeNodes...)
 
-	// 2. Ask the ring who should own this key
-	targetNode := ring.GetNode(key)
+	targetNodes := ring.GetNodes(key, 2)
 
-	// 3. If THIS node is the owner, save it locally!
-	if targetNode == s.nodeName {
-		s.cache.Set(key, val)
-		fmt.Fprintf(w, "Success! Stored: %s = %s (Saved locally on %s)\n", key, val, s.nodeName)
-		return
+	// Concurrency tools
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var successCount atomic.Int32
+
+	// Loop through our targets and launch a goroutine for each one
+	for _, targetNode := range targetNodes {
+		wg.Add(1) // Tell the WaitGroup we are starting a new task
+
+		// Launch the concurrent goroutine
+		go func(node string) {
+			defer wg.Done() // Tell the WaitGroup when this specific task finishes
+
+			if node == s.nodeName {
+				// Save locally
+				s.cache.Set(key, val, ttl)
+				fmt.Printf("Saved '%s' locally on %s with TTL %d\n", key, s.nodeName, ttl)
+
+				// Safely increment our success counter
+				mu.Lock()
+				successCount.Add(1)
+				mu.Unlock()
+			} else {
+				// Proxy over the network
+				targetPort := node[5:]
+				forwardURL := fmt.Sprintf("http://localhost:%s/set?key=%s&val=%s&ttl=%d", targetPort, key, val, ttl)
+
+				fmt.Printf("Replicating '%s' to backup node %s...\n", key, node)
+				resp, err := http.Get(forwardURL)
+
+				if err == nil && resp.StatusCode == http.StatusOK {
+					mu.Lock()
+					successCount.Add(1)
+					mu.Unlock()
+					resp.Body.Close()
+				}
+			}
+		}(targetNode) // Pass the variable into the closure
 	}
 
-	// 4. PROXY: If another node should own it, forward the SET request!
-	targetPort := targetNode[5:]
-	forwardURL := fmt.Sprintf("http://localhost:%s/set?key=%s&val=%s", targetPort, key, val)
+	// Wait here until all goroutines call wg.Done()
+	wg.Wait()
 
-	fmt.Printf("Proxying SET request for '%s' to %s...\n", key, targetNode)
-
-	// Make the HTTP POST/GET to the other node
-	resp, err := http.Get(forwardURL)
-	if err != nil {
-		http.Error(w, "Failed to reach target node", http.StatusInternalServerError)
-		return
+	if successCount.Load() > 0 {
+		fmt.Fprintf(w, "Success! Key '%s' saved to %d node(s) concurrently.\n", key, successCount.Load())
+	} else {
+		http.Error(w, "Failed to write to any nodes", http.StatusInternalServerError)
 	}
-	defer resp.Body.Close()
-
-	// 5. Copy the response back to the user
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
 }
 
 // handleGet processes incoming GET requests.

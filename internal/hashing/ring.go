@@ -2,6 +2,7 @@ package hashing
 
 import (
 	"hash/crc32"
+	"slices"
 	"sort"
 	"strconv"
 )
@@ -41,9 +42,7 @@ func (r *HashRing) AddNodes(nodeNames ...string) {
 	}
 
 	// The magic of the ring: sort the hashes from smallest to largest!
-	sort.Slice(r.keys, func(i, j int) bool {
-		return r.keys[i] < r.keys[j]
-	})
+	slices.Sort(r.keys)
 }
 
 // GetNode takes a user's key (e.g. "hero") and figures out which node should hold it.
@@ -68,4 +67,42 @@ func (r *HashRing) GetNode(key string) string {
 
 	// Return the name of the actual physical node (e.g. "node-8081")
 	return r.hashMap[r.keys[idx]]
+}
+
+// GetNodes returns the top N distinct physical nodes for a given key.
+func (r *HashRing) GetNodes(key string, count int) []string {
+	if len(r.keys) == 0 {
+		return nil
+	}
+
+	hash := crc32.ChecksumIEEE([]byte(key))
+	idx := sort.Search(len(r.keys), func(i int) bool {
+		return r.keys[i] >= hash
+	})
+
+	if idx == len(r.keys) {
+		idx = 0
+	}
+
+	var uniqueNodes []string
+	seen := make(map[string]bool)
+
+	// Walk around the ring clockwise
+	for len(uniqueNodes) < count && len(uniqueNodes) < len(r.hashMap) {
+		nodeName := r.hashMap[r.keys[idx]]
+
+		// Only add it if we haven't seen this physical node yet
+		if !seen[nodeName] {
+			seen[nodeName] = true
+			uniqueNodes = append(uniqueNodes, nodeName)
+		}
+
+		// Move to the next virtual node
+		idx++
+		if idx == len(r.keys) {
+			idx = 0 // Wrap around the ring
+		}
+	}
+
+	return uniqueNodes
 }
