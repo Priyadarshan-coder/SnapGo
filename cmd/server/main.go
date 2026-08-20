@@ -19,7 +19,7 @@ func main() {
 
 	// 2. Initialize the core cache engine
 	// Tell the background sweeper to run every 10 seconds
-	myCache := cache.New(10 * time.Second)
+	myCache := cache.New(100, 10*time.Second)
 
 	// 3. Initialize the Gossip Membership
 	fmt.Println("Starting gossip protocol...")

@@ -15,10 +15,10 @@ import (
 type Server struct {
 	cache      *cache.Cache
 	membership *discovery.Membership
-	nodeName   string // The name of THIS node (e.g., "node-8080")
+	nodeName   string
 }
 
-// Update the New function to accept the new dependencies
+// New initializes the HTTP Server with the cache, membership, and node name
 func New(c *cache.Cache, m *discovery.Membership, port int) *Server {
 	return &Server{
 		cache:      c,
@@ -34,7 +34,6 @@ func (s *Server) Start(port int) error {
 	// 1. Create a brand new, isolated multiplexer (router)
 	mux := http.NewServeMux()
 
-	// 2. Attach our routes specifically to THIS mux, not the global one
 	mux.HandleFunc("/set", s.handleSet)
 	mux.HandleFunc("/get", s.handleGet)
 
@@ -48,10 +47,13 @@ func (s *Server) Start(port int) error {
 func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("key")
 	val := r.URL.Query().Get("val")
+	isReplica := r.URL.Query().Get("replica") == "true" // Check if it's internal traffic
+
 	if key == "" || val == "" {
 		http.Error(w, "Missing key or val", http.StatusBadRequest)
 		return
 	}
+
 	// Parse the TTL (default to 0 if not provided)
 	ttlStr := r.URL.Query().Get("ttl")
 	ttl := 0
@@ -61,7 +63,13 @@ func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 			ttl = parsed
 		}
 	}
-
+	if isReplica {
+		// If another node proxied this to us, just save it locally and exit!
+		s.cache.Set(key, val, ttl)
+		fmt.Printf("Saved '%s' locally on %s (via Replica)\n", key, s.nodeName)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	activeNodes := s.membership.GetMembers()
 	ring := hashing.New(50)
 	ring.AddNodes(activeNodes...)
@@ -75,25 +83,23 @@ func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 
 	// Loop through our targets and launch a goroutine for each one
 	for _, targetNode := range targetNodes {
-		wg.Add(1) // Tell the WaitGroup we are starting a new task
+		wg.Add(1)
 
-		// Launch the concurrent goroutine
 		go func(node string) {
-			defer wg.Done() // Tell the WaitGroup when this specific task finishes
+			defer wg.Done()
 
 			if node == s.nodeName {
 				// Save locally
 				s.cache.Set(key, val, ttl)
 				fmt.Printf("Saved '%s' locally on %s with TTL %d\n", key, s.nodeName, ttl)
 
-				// Safely increment our success counter
 				mu.Lock()
 				successCount.Add(1)
 				mu.Unlock()
 			} else {
-				// Proxy over the network
+				// Proxy over the network with the &replica=true flag!
 				targetPort := node[5:]
-				forwardURL := fmt.Sprintf("http://localhost:%s/set?key=%s&val=%s&ttl=%d", targetPort, key, val, ttl)
+				forwardURL := fmt.Sprintf("http://localhost:%s/set?key=%s&val=%s&ttl=%d&replica=true", targetPort, key, val, ttl)
 
 				fmt.Printf("Replicating '%s' to backup node %s...\n", key, node)
 				resp, err := http.Get(forwardURL)
@@ -105,7 +111,7 @@ func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 					resp.Body.Close()
 				}
 			}
-		}(targetNode) // Pass the variable into the closure
+		}(targetNode)
 	}
 
 	// Wait here until all goroutines call wg.Done()
@@ -121,11 +127,22 @@ func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 // handleGet processes incoming GET requests.
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("key")
+	isInternal := r.URL.Query().Get("internal") == "true" // Check for internal proxy traffic
+
 	if key == "" {
 		http.Error(w, "Missing key", http.StatusBadRequest)
 		return
 	}
-
+	if isInternal {
+		// If another node proxied this to us, do NOT ask the hash ring. Just check local RAM.
+		val, found := s.cache.Get(key)
+		if !found {
+			http.Error(w, "Key not found locally", http.StatusNotFound)
+			return
+		}
+		fmt.Fprintf(w, "Value: %s (Served locally from %s)\n", val, s.nodeName)
+		return
+	}
 	// 1. Build the Hash Ring with the currently active nodes
 	activeNodes := s.membership.GetMembers()
 	ring := hashing.New(50) // 50 virtual nodes for even distribution
@@ -146,9 +163,9 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 4. PROXY: If another node owns it, forward the request!
-	// We extract the port from the target node name (e.g., "node-8081" -> "8081")
+	// Add the &internal=true flag to prevent GET loops!
 	targetPort := targetNode[5:]
-	forwardURL := fmt.Sprintf("http://localhost:%s/get?key=%s", targetPort, key)
+	forwardURL := fmt.Sprintf("http://localhost:%s/get?key=%s&internal=true", targetPort, key)
 
 	fmt.Printf("Proxying GET request for '%s' to %s...\n", key, targetNode)
 
